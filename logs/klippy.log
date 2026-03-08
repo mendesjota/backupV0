@@ -1,0 +1,1594 @@
+===== Config file =====
+[virtual_sdcard]
+path = ~/printer_data/gcodes
+on_error_gcode = CANCEL_PRINT
+
+[pause_resume]
+
+[display_status]
+
+[respond]
+
+[gcode_macro CANCEL_PRINT]
+description = Cancel the actual running print
+rename_existing = BASE_CANCEL_PRINT
+gcode = 
+	SET_IDLE_TIMEOUT TIMEOUT={printer.configfile.settings.idle_timeout.timeout}
+	CLEAR_PAUSE
+	SDCARD_RESET_FILE
+	PRINT_END
+	BASE_CANCEL_PRINT
+	M106 S0
+
+[gcode_macro PAUSE]
+description = Pause the actual running print
+rename_existing = BASE_PAUSE
+gcode = 
+	
+	{% set z = params.Z|default(10)|int %}
+	
+	{% if printer['pause_resume'].is_paused|int == 0 %}
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE={z}
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=etemp VALUE={printer['extruder'].target}
+	
+	SAVE_GCODE_STATE NAME=PAUSE
+	BASE_PAUSE
+	{% if (printer.gcode_move.position.z + z) < printer.toolhead.axis_maximum.z %}
+	G91
+	G1 Z{z} F900
+	{% else %}
+	{ action_respond_info("Pause zhop exceeds maximum Z height.") }
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE=0
+	{% endif %}
+	G90
+	G1 X{printer.toolhead.axis_maximum.x/2} Y{printer.toolhead.axis_minimum.y+5} F6000
+	SAVE_GCODE_STATE NAME=PAUSEPARK
+	SET_IDLE_TIMEOUT TIMEOUT=43200
+	{% endif %}
+
+[gcode_macro RESUME]
+description = Resume the actual running print
+rename_existing = BASE_RESUME
+variable_last_extruder_temp = {'restore': False, 'temp': 0}
+variable_restore_idle_timeout = 0
+variable_idle_state = False
+gcode = 
+	
+	{% set e = params.E|default(2.5)|int %}
+	
+	{% if printer['pause_resume'].is_paused|int == 1 %}
+	
+	SET_IDLE_TIMEOUT TIMEOUT={printer.configfile.settings.idle_timeout.timeout}
+	RESTORE_GCODE_STATE NAME=PAUSEPARK MOVE=1 MOVE_SPEED=100
+	G91
+	M83
+	G1 E{e} F900
+	RESTORE_GCODE_STATE NAME=PAUSE MOVE=1 MOVE_SPEED=60
+	BASE_RESUME
+	{% endif %}
+variable_zhop = 0
+variable_etemp = 0
+
+[gcode_macro SET_PAUSE_NEXT_LAYER]
+description = Enable a pause if the next layer is reached
+gcode = 
+	{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_next_layer %}
+	{% set ENABLE = params.ENABLE|default(1)|int != 0 %}
+	{% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"
+
+[gcode_macro SET_PAUSE_AT_LAYER]
+description = Enable/disable a pause if a given layer number is reached
+gcode = 
+	{% set pause_at_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_at_layer %}
+	{% set ENABLE = params.ENABLE|int != 0 if params.ENABLE is defined
+	else params.LAYER is defined %}
+	{% set LAYER = params.LAYER|default(pause_at_layer.layer)|int %}
+	{% set MACRO = params.MACRO|default(pause_at_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_at_layer VALUE="{{ 'enable': ENABLE, 'layer': LAYER, 'call': MACRO }}"
+
+[gcode_macro SET_PRINT_STATS_INFO]
+rename_existing = SET_PRINT_STATS_INFO_BASE
+description = Overwrite, to get pause_next_layer and pause_at_layer feature
+variable_pause_next_layer = { 'enable': False, 'call': "PAUSE" }
+variable_pause_at_layer = { 'enable': False, 'layer': 0, 'call': "PAUSE" }
+gcode = 
+	{% if pause_next_layer.enable %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_next_layer" % pause_next_layer.call}'
+	{pause_next_layer.call}
+	SET_PAUSE_NEXT_LAYER ENABLE=0
+	{% elif pause_at_layer.enable and params.CURRENT_LAYER is defined and params.CURRENT_LAYER|int == pause_at_layer.layer %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}'
+	{pause_at_layer.call}
+	SET_PAUSE_AT_LAYER ENABLE=0
+	{% endif %}
+	SET_PRINT_STATS_INFO_BASE {rawparams}
+
+[gcode_macro _TOOLHEAD_PARK_PAUSE_CANCEL]
+description = Helper: park toolhead used in PAUSE and CANCEL_PRINT
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set velocity = printer.configfile.settings.pause_resume.recover_velocity %}
+	{% set use_custom     = client.use_custom_pos|default(false)|lower == 'true' %}
+	{% set custom_park_x  = client.custom_park_x|default(0.0) %}
+	{% set custom_park_y  = client.custom_park_y|default(0.0) %}
+	{% set park_dz        = client.custom_park_dz|default(2.0)|abs %}
+	{% set sp_hop         = client.speed_hop|default(15) * 60 %}
+	{% set sp_move        = client.speed_move|default(velocity) * 60 %}
+	
+	{% set origin    = printer.gcode_move.homing_origin %}
+	{% set act       = printer.gcode_move.gcode_position %}
+	{% set max       = printer.toolhead.axis_maximum %}
+	{% set cone      = printer.toolhead.cone_start_z|default(max.z) %}
+	{% set round_bed = True if printer.configfile.settings.printer.kinematics is in ['delta','polar','rotary_delta','winch']
+	else False %}
+	
+	{% set z_min = params.Z_MIN|default(0)|float %}
+	{% set z_park = [[(act.z + park_dz), z_min]|max, (max.z - origin.z)]|min %}
+	{% set x_park = params.X       if params.X is defined
+	else custom_park_x  if use_custom
+	else 0.0            if round_bed
+	else (max.x - 5.0) %}
+	{% set y_park = params.Y       if params.Y is defined
+	else custom_park_y  if use_custom
+	else (max.y - 5.0)  if round_bed and z_park < cone
+	else 0.0            if round_bed
+	else (max.y - 5.0) %}
+	
+	_CLIENT_RETRACT
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G90
+	G1 Z{z_park} F{sp_hop}
+	G1 X{x_park} Y{y_park} F{sp_move}
+	{% if not printer.gcode_move.absolute_coordinates %} G91 {% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='Printer not homed'
+	{% endif %}
+
+[gcode_macro _CLIENT_EXTRUDE]
+description = Extrudes, if the extruder is hot enough
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set use_fw_retract = (client.use_fw_retract|default(false)|lower == 'true') and (printer.firmware_retraction is defined) %}
+	{% set length = params.LENGTH|default(client.unretract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_unretract)|default(35) %}
+	{% set absolute_extrude = printer.gcode_move.absolute_extrude %}
+	
+	{% if printer.toolhead.extruder != '' %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if use_fw_retract %}
+	{% if length < 0 %}
+	G10
+	{% else %}
+	G11
+	{% endif %}
+	{% else %}
+	M83
+	G1 E{length} F{(speed|float|abs) * 60}
+	{% if absolute_extrude %}
+	M82
+	{% endif %}
+	{% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='{"\"%s\" not hot enough" % printer.toolhead.extruder}'
+	{% endif %}
+	{% endif %}
+
+[gcode_macro _CLIENT_RETRACT]
+description = Retracts, if the extruder is hot enough
+gcode = 
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set length = params.LENGTH|default(client.retract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_retract)|default(35) %}
+	
+	_CLIENT_EXTRUDE LENGTH=-{length|float|abs} SPEED={speed|float|abs}
+
+[exclude_object]
+
+[gcode_macro VORON_PURGE]
+description = A purge macro that adapts to be near your actual printed objects
+gcode = 
+	
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	{% set cross_section = printer.configfile.settings.extruder.max_extrude_cross_section | float %}
+	
+	
+	{% if printer.firmware_retraction is defined %}
+	{% set RETRACT = G10 | string %}
+	{% set UNRETRACT = G11 | string %}
+	{% else %}
+	{% set RETRACT = 'G1 E-.5 F2100' | string %}
+	{% set UNRETRACT = 'G1 E.5 F2100' | string %}
+	{% endif %}
+	
+	
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set purge_height = kamp_settings.purge_height | float %}
+	{% set tip_distance = kamp_settings.tip_distance | float %}
+	{% set purge_margin = kamp_settings.purge_margin | float %}
+	{% set purge_amount = kamp_settings.purge_amount | float %}
+	{% set flow_rate = kamp_settings.flow_rate | float %}
+	{% set size = 10 | float %}
+	
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set purge_x_min = (all_points | map(attribute=0) | min | default(0)) %}
+	{% set purge_x_max = (all_points | map(attribute=0) | max | default(0)) %}
+	{% set purge_y_min = (all_points | map(attribute=1) | min | default(0)) %}
+	{% set purge_y_max = (all_points | map(attribute=1) | max | default(0)) %}
+	
+	{% set purge_x_center = ([((purge_x_max + purge_x_min) / 2) - (purge_amount / 2), 0] | max) %}
+	{% set purge_y_center = ([((purge_y_max + purge_y_min) / 2) - (purge_amount / 2), 0] | max) %}
+	
+	{% set purge_x_origin = ([purge_x_min - purge_margin, 0] | max) %}
+	{% set purge_y_origin = ([purge_y_min - purge_margin, 0] | max) %}
+	
+	
+	{% set purge_move_speed = (flow_rate / 5.0) * 60 | float %}
+	
+	{% if cross_section < 5 %}
+	
+	{action_respond_info("[Extruder] max_extrude_cross_section is insufficient for purge, please set it to 5 or greater. Purge skipped.")}
+	
+	{% else %}
+	
+	{% if verbose_enable == True %}
+	
+	{action_respond_info("Moving filament tip {}mms".format(
+	(tip_distance),
+	)) }
+	{% endif %}
+	
+	{% if printer.firmware_retraction is defined %}
+	{action_respond_info("KAMP purge is using firmware retraction.")}
+	{% else %}
+	{action_respond_info("KAMP purge is not using firmware retraction, it is recommended to configure it.")}
+	{% endif %}
+	
+	SAVE_GCODE_STATE NAME=Prepurge_State
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_origin} Y{purge_y_origin+size/2}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 X{purge_x_origin+size*0.289} Y{purge_y_origin+size} E{purge_amount/4} F{purge_move_speed}
+	{RETRACT}
+	G0 Z{purge_height*2}
+	G0 X{purge_x_origin+size*0.789} Y{purge_y_origin+size}
+	G0 Z{purge_height}
+	{UNRETRACT}
+	G1 X{purge_x_origin+size*0.211} Y{purge_y_origin} E{purge_amount/2} F{purge_move_speed}
+	{RETRACT}
+	G0 Z{purge_height*2}
+	G0 X{purge_x_origin+size*0.711} Y{purge_y_origin}
+	G0 Z{purge_height}
+	{UNRETRACT}
+	G1 X{purge_x_origin+size} Y{purge_y_origin+size/2}  E{purge_amount/4} F{purge_move_speed}
+	{RETRACT}
+	G92 E0
+	M82
+	G0 Z{purge_height*2} F{travel_speed}
+	
+	RESTORE_GCODE_STATE NAME=Prepurge_State
+	
+	{% endif %}
+
+[gcode_macro _KAMP_Settings]
+description = This macro contains all adjustable settings for KAMP
+variable_verbose_enable = True
+variable_mesh_margin = 0
+variable_fuzz_amount = 0
+variable_probe_dock_enable = False
+variable_attach_macro = 'Attach_Probe'
+variable_detach_macro = 'Dock_Probe'
+variable_purge_height = 0.8
+variable_tip_distance = 45
+variable_purge_margin = 10
+variable_purge_amount = 30
+variable_flow_rate = 12
+variable_smart_park_height = 10
+gcode = 
+	
+	{action_respond_info(" Running the KAMP_Settings macro does nothing, it is only used for storing KAMP settings. ")}
+
+[mcu]
+canbus_uuid = b0bc8d3af556
+
+[temperature_sensor mcu_temp]
+sensor_type = temperature_mcu
+min_temp = 0
+max_temp = 100
+
+[printer]
+kinematics = corexy
+max_velocity = 500
+max_accel = 20000
+max_z_velocity = 15
+max_z_accel = 45
+square_corner_velocity = 8.0
+
+[input_shaper]
+shaper_freq_x = 126.4
+shaper_type_x = mzv
+shaper_freq_y = 82.8
+shaper_type_y = mzv
+
+[stepper_x]
+step_pin = PC0
+dir_pin = PC1
+enable_pin = !PC3
+rotation_distance = 40
+microsteps = 32
+full_steps_per_rotation = 200
+endstop_pin = tmc2209_stepper_x:virtual_endstop
+position_endstop = 120.0
+position_max = 120.0
+homing_speed = 40
+homing_retract_dist = 0
+homing_positive_dir = true
+
+[tmc2209 stepper_x]
+uart_pin = PB3
+uart_address = 0
+interpolate = False
+run_current = 0.6
+sense_resistor = 0.220
+stealthchop_threshold = 0
+diag_pin = ^PA2
+driver_sgthrs = 100
+
+[stepper_y]
+step_pin = PC14
+dir_pin = PC13
+enable_pin = !PC15
+rotation_distance = 40
+microsteps = 32
+full_steps_per_rotation = 200
+endstop_pin = tmc2209_stepper_y:virtual_endstop
+position_endstop = 119.0
+position_max = 119.0
+homing_speed = 40
+homing_retract_dist = 0
+homing_positive_dir = true
+
+[tmc2209 stepper_y]
+uart_pin = PB3
+uart_address = 1
+interpolate = False
+run_current = 0.6
+sense_resistor = 0.220
+stealthchop_threshold = 0
+diag_pin = ^PA3
+driver_sgthrs = 100
+
+[stepper_z]
+step_pin = PB4
+dir_pin = !PB5
+enable_pin = !PC2
+rotation_distance = 8
+microsteps = 32
+endstop_pin = ^PC4
+position_endstop = 119.6
+position_max = 119.6
+position_min = 0
+homing_speed = 20
+second_homing_speed = 3.0
+homing_retract_dist = 3.0
+
+[tmc2209 stepper_z]
+uart_pin = PB3
+uart_address = 2
+interpolate = False
+run_current = 0.3
+sense_resistor = 0.220
+stealthchop_threshold = 0
+
+[extruder]
+step_pin = PB2
+dir_pin = !PA15
+enable_pin = !PD2
+full_steps_per_rotation = 200
+rotation_distance = 22.40
+gear_ratio = 50:10
+microsteps = 32
+nozzle_diameter = 0.400
+filament_diameter = 1.750
+heater_pin = PC7
+sensor_type = Generic 3950
+sensor_pin = PC5
+min_temp = 0
+max_temp = 280
+min_extrude_temp = 170
+max_extrude_only_distance = 150
+max_extrude_cross_section = 5.0
+pressure_advance = 0.0
+pressure_advance_smooth_time = 0.040
+control = pid
+pid_kp = 27.029
+pid_ki = 1.133
+pid_kd = 161.158
+
+[tmc2209 extruder]
+uart_pin = PB3
+uart_address = 3
+interpolate = False
+run_current = 0.4
+sense_resistor = 0.220
+stealthchop_threshold = 0
+
+[firmware_retraction]
+retract_length = 0.8
+retract_speed = 40
+unretract_extra_length = 0
+unretract_speed = 40
+
+[verify_heater extruder]
+max_error = 150
+check_gain_time = 40
+hysteresis = 10
+heating_gain = 2
+
+[heater_bed]
+heater_pin = PC8
+sensor_type = Generic 3950
+sensor_pin = PB0
+smooth_time = 3.0
+min_temp = 0
+max_temp = 120
+control = pid
+pid_kp = 65.665
+pid_ki = 3.367
+pid_kd = 320.117
+
+[heater_fan hotend_fan]
+pin = PA13
+max_power = 1.0
+kick_start_time = 0.5
+heater = extruder
+heater_temp = 50.0
+
+[fan]
+pin = PA14
+max_power = 1.0
+kick_start_time = 0.5
+off_below = 0.13
+cycle_time = 0.010
+
+[temperature_fan btt_pi]
+pin = PA8
+max_power = 1
+shutdown_speed = 0.0
+cycle_time = 0.01
+hardware_pwm = False
+kick_start_time = 0
+sensor_type = temperature_host
+min_temp = 10
+max_temp = 80
+target_temp = 45
+max_speed = 1
+min_speed = 0.0
+control = pid
+pid_kp = 2.0
+pid_ki = 5.0
+pid_kd = 0.5
+pid_deriv_time = 2.0
+gcode_id = pi
+
+[idle_timeout]
+timeout = 36000
+
+[homing_override]
+gcode = 
+	_HOME_X
+	_HOME_Y
+	G28 Z
+
+[bed_screws]
+screw1 = 60,5
+screw1_name = front screw
+screw2 = 5,115
+screw2_name = back left
+screw3 = 115,115
+screw3_name = back right
+
+[neopixel board_rgb]
+pin = PC9
+chain_count = 1
+color_order = GRB
+initial_red = 0.0
+initial_green = 0.1
+initial_blue = 0.0
+
+[gcode_macro PRINT_START]
+gcode = 
+	{% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+	{% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(190)|float %}
+	
+	G90
+	G92 E0
+	
+	
+	M140 S{BED_TEMP}
+	M104 S{EXTRUDER_TEMP}
+	
+	
+	_CG28
+	G28 Z
+	G90
+	
+	
+	M190 S{BED_TEMP}
+	M109 S{EXTRUDER_TEMP}
+	
+	
+	G1 Z5 F3000
+	VORON_PURGE
+	
+	G92 E0
+
+[gcode_macro PRINT_END]
+gcode = 
+	TURN_OFF_HEATERS
+	G91
+	G1 Z10 F1500
+	G1 E-1 F3000
+	G90
+	G1 X100 Y100 F3000
+	M106 S0
+	SET_STEPPER_ENABLE STEPPER=extruder ENABLE=0
+	BED_MESH_CLEAR
+
+[gcode_macro _HOME_X]
+gcode = 
+	
+	{% set RUN_CURRENT_X = printer.configfile.settings['tmc2209 stepper_x'].run_current|float %}
+	{% set RUN_CURRENT_Y = printer.configfile.settings['tmc2209 stepper_y'].run_current|float %}
+	{% set HOME_CURRENT_X = RUN_CURRENT_X / 2 %}
+	{% set HOME_CURRENT_Y = RUN_CURRENT_Y / 2 %}
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={HOME_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={HOME_CURRENT_Y}
+	
+	set_tmc_field stepper=stepper_x field=tcoolthrs value=1048575
+	set_tmc_field stepper=stepper_y field=tcoolthrs value=1048575
+	
+	
+	G28 X
+	
+	G91
+	G1 X-10 F1200
+	
+	
+	G4 P100
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={RUN_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={RUN_CURRENT_Y}
+
+[gcode_macro _HOME_Y]
+gcode = 
+	
+	{% set RUN_CURRENT_X = printer.configfile.settings['tmc2209 stepper_x'].run_current|float %}
+	{% set RUN_CURRENT_Y = printer.configfile.settings['tmc2209 stepper_y'].run_current|float %}
+	{% set HOME_CURRENT_X = RUN_CURRENT_X / 2 %}
+	{% set HOME_CURRENT_Y = RUN_CURRENT_Y / 2 %}
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={HOME_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={HOME_CURRENT_Y}
+	
+	set_tmc_field stepper=stepper_x field=tcoolthrs value=1048575
+	set_tmc_field stepper=stepper_y field=tcoolthrs value=1048575
+	
+	
+	G28 Y
+	
+	G91
+	G1 Y-10 F1200
+	
+	
+	G4 P1000
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={RUN_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={RUN_CURRENT_Y}
+
+[gcode_macro M600]
+gcode = 
+	SAVE_GCODE_STATE NAME=M600_state
+	PAUSE
+	M300
+	G91
+	G1 E-50 F1000
+	M300
+	M300
+	RESTORE_GCODE_STATE NAME=M600_state
+
+[gcode_macro _CG28]
+gcode = 
+	{% if "xyz" not in printer.toolhead.homed_axes %}
+	G28
+	{% endif %}
+
+[gcode_macro LOAD_FILAMENT]
+gcode = 
+	M83
+	G1 E30 F300
+	G1 E15 F150
+	M82
+
+[gcode_macro UNLOAD_FILAMENT]
+gcode = 
+	M83
+	G1 E10 F300
+	G1 E-40 F1800
+	M82
+=======================
+Args: ['/home/biqu/klipper/klippy/klippy.py', '/home/biqu/printer_data/config/printer.cfg', '-I', '/home/biqu/printer_data/comms/klippy.serial', '-l', '/home/biqu/printer_data/logs/klippy.log', '-a', '/home/biqu/printer_data/comms/klippy.sock']
+Git version: 'v0.12.0-125-gbfb71bc2d'
+Branch: master
+Remote: origin
+Tracked URL: https://github.com/Klipper3d/klipper
+CPU: 4 core ?
+Python: '3.9.2 (default, Feb 28 2021, 17:03:44) \n[GCC 10.2.1 20210110]'
+webhooks client 281473773304224: {'program': 'Moonraker', 'version': 'v0.8.0-324-ga3e4dac'}
+=============== Log rollover at Sun Mar  8 15:36:14 2026 ===============
+Created a socket
+mcu 'mcu': Unable to open CAN port: Failed to transmit: [Errno 105] No buffer space available
+Created a socket
+mcu 'mcu': Unable to open CAN port: Failed to transmit: [Errno 105] No buffer space available
+Created a socket
+mcu 'mcu': Unable to open CAN port: Failed to transmit: [Errno 105] No buffer space available
+Created a socket
+mcu 'mcu': Unable to open CAN port: Failed to transmit: [Errno 105] No buffer space available
+Created a socket
+mcu 'mcu': Unable to open CAN port: Failed to transmit: [Errno 105] No buffer space available
+MCU error during connect
+Traceback (most recent call last):
+  File "/home/biqu/klipper/klippy/mcu.py", line 763, in _mcu_identify
+    self._serial.connect_canbus(self._serialport, nodeid,
+  File "/home/biqu/klipper/klippy/serialhdl.py", line 133, in connect_canbus
+    self._error("Unable to connect")
+  File "/home/biqu/klipper/klippy/serialhdl.py", line 61, in _error
+    raise error(self.warn_prefix + (msg % params))
+serialhdl.error: mcu 'mcu': Unable to connect
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/biqu/klipper/klippy/klippy.py", line 176, in _connect
+    self.send_event("klippy:mcu_identify")
+  File "/home/biqu/klipper/klippy/klippy.py", line 263, in send_event
+    return [cb(*params) for cb in self.event_handlers.get(event, [])]
+  File "/home/biqu/klipper/klippy/klippy.py", line 263, in <listcomp>
+    return [cb(*params) for cb in self.event_handlers.get(event, [])]
+  File "/home/biqu/klipper/klippy/mcu.py", line 774, in _mcu_identify
+    raise error(str(e))
+mcu.error: mcu 'mcu': Unable to connect
+Build file /home/biqu/klipper/klippy/../.config(3382): Wed Nov 26 03:54:33 2025
+========= Last MCU build config =========
+CONFIG_LOW_LEVEL_OPTIONS=y
+# CONFIG_MACH_AVR is not set
+# CONFIG_MACH_ATSAM is not set
+# CONFIG_MACH_ATSAMD is not set
+# CONFIG_MACH_LPC176X is not set
+CONFIG_MACH_STM32=y
+# CONFIG_MACH_HC32F460 is not set
+# CONFIG_MACH_RP2040 is not set
+# CONFIG_MACH_PRU is not set
+# CONFIG_MACH_AR100 is not set
+# CONFIG_MACH_LINUX is not set
+# CONFIG_MACH_SIMU is not set
+CONFIG_BOARD_DIRECTORY="stm32"
+CONFIG_MCU="stm32f446xx"
+CONFIG_CLOCK_FREQ=180000000
+CONFIG_FLASH_SIZE=0x80000
+CONFIG_FLASH_BOOT_ADDRESS=0x8000000
+CONFIG_RAM_START=0x20000000
+CONFIG_RAM_SIZE=0x20000
+CONFIG_STACK_SIZE=512
+CONFIG_FLASH_APPLICATION_ADDRESS=0x8008000
+CONFIG_STM32_SELECT=y
+# CONFIG_MACH_STM32F103 is not set
+# CONFIG_MACH_STM32F207 is not set
+# CONFIG_MACH_STM32F401 is not set
+# CONFIG_MACH_STM32F405 is not set
+# CONFIG_MACH_STM32F407 is not set
+# CONFIG_MACH_STM32F429 is not set
+CONFIG_MACH_STM32F446=y
+# CONFIG_MACH_STM32F765 is not set
+# CONFIG_MACH_STM32F031 is not set
+# CONFIG_MACH_STM32F042 is not set
+# CONFIG_MACH_STM32F070 is not set
+# CONFIG_MACH_STM32F072 is not set
+# CONFIG_MACH_STM32G070 is not set
+# CONFIG_MACH_STM32G071 is not set
+# CONFIG_MACH_STM32G0B0 is not set
+# CONFIG_MACH_STM32G0B1 is not set
+# CONFIG_MACH_STM32G431 is not set
+# CONFIG_MACH_STM32H723 is not set
+# CONFIG_MACH_STM32H743 is not set
+# CONFIG_MACH_STM32H750 is not set
+# CONFIG_MACH_STM32L412 is not set
+# CONFIG_MACH_N32G452 is not set
+# CONFIG_MACH_N32G455 is not set
+CONFIG_MACH_STM32F4=y
+CONFIG_HAVE_STM32_USBOTG=y
+CONFIG_HAVE_STM32_CANBUS=y
+CONFIG_HAVE_STM32_USBCANBUS=y
+CONFIG_STM32_DFU_ROM_ADDRESS=0
+CONFIG_STM32_FLASH_START_8000=y
+# CONFIG_STM32_FLASH_START_10000 is not set
+# CONFIG_STM32_FLASH_START_0000 is not set
+# CONFIG_STM32_CLOCK_REF_8M is not set
+CONFIG_STM32_CLOCK_REF_12M=y
+# CONFIG_STM32_CLOCK_REF_16M is not set
+# CONFIG_STM32_CLOCK_REF_20M is not set
+# CONFIG_STM32_CLOCK_REF_24M is not set
+# CONFIG_STM32_CLOCK_REF_25M is not set
+# CONFIG_STM32_CLOCK_REF_INTERNAL is not set
+CONFIG_CLOCK_REF_FREQ=12000000
+CONFIG_STM32F0_TRIM=16
+# CONFIG_STM32_USB_PA11_PA12 is not set
+# CONFIG_STM32_SERIAL_USART1 is not set
+# CONFIG_STM32_SERIAL_USART1_ALT_PB7_PB6 is not set
+# CONFIG_STM32_SERIAL_USART2 is not set
+# CONFIG_STM32_SERIAL_USART2_ALT_PD6_PD5 is not set
+# CONFIG_STM32_SERIAL_USART3 is not set
+# CONFIG_STM32_SERIAL_USART3_ALT_PD9_PD8 is not set
+# CONFIG_STM32_CANBUS_PA11_PA12 is not set
+# CONFIG_STM32_CANBUS_PA11_PB9 is not set
+CONFIG_STM32_MMENU_CANBUS_PB8_PB9=y
+# CONFIG_STM32_MMENU_CANBUS_PI9_PH13 is not set
+# CONFIG_STM32_MMENU_CANBUS_PB5_PB6 is not set
+# CONFIG_STM32_MMENU_CANBUS_PB12_PB13 is not set
+# CONFIG_STM32_MMENU_CANBUS_PD0_PD1 is not set
+# CONFIG_STM32_USBCANBUS_PA11_PA12 is not set
+CONFIG_STM32_CANBUS_PB8_PB9=y
+CONFIG_USB_VENDOR_ID=0x1d50
+CONFIG_USB_DEVICE_ID=0x614e
+CONFIG_USB_SERIAL_NUMBER="12345"
+CONFIG_WANT_GPIO_BITBANGING=y
+CONFIG_WANT_DISPLAYS=y
+CONFIG_WANT_SENSORS=y
+CONFIG_WANT_LIS2DW=y
+CONFIG_WANT_SOFTWARE_I2C=y
+CONFIG_WANT_SOFTWARE_SPI=y
+CONFIG_NEED_SENSOR_BULK=y
+CONFIG_CANSERIAL=y
+CONFIG_CANBUS=y
+CONFIG_CANBUS_FREQUENCY=1000000
+CONFIG_CANBUS_FILTER=y
+CONFIG_INITIAL_PINS=""
+CONFIG_HAVE_GPIO=y
+CONFIG_HAVE_GPIO_ADC=y
+CONFIG_HAVE_GPIO_SPI=y
+CONFIG_HAVE_GPIO_SDIO=y
+CONFIG_HAVE_GPIO_I2C=y
+CONFIG_HAVE_GPIO_HARD_PWM=y
+CONFIG_HAVE_STRICT_TIMING=y
+CONFIG_HAVE_CHIPID=y
+CONFIG_HAVE_STEPPER_BOTH_EDGE=y
+CONFIG_HAVE_BOOTLOADER_REQUEST=y
+CONFIG_INLINE_STEPPER_HACK=y
+=======================
+Build file /home/biqu/klipper/klippy/../out/klipper.dict(8570): Wed Nov 26 03:55:23 2025
+Last MCU build version: v0.12.0-125-gbfb71bc2d
+Last MCU build tools: gcc: (15:8-2019-q3-1+b1) 8.3.1 20190703 (release) [gcc-8-branch revision 273027] binutils: (2.35.2-2+14+b2) 2.35.2
+Last MCU build config: ADC_MAX=4095 BUS_PINS_i2c1=PB6,PB7 BUS_PINS_i2c1a=PB8,PB9 BUS_PINS_i2c2=PB10,PB11 BUS_PINS_i2c3=PA8,PC9 BUS_PINS_sdio=PC12,PD2,PC8,PC9,PC10,PC11 BUS_PINS_spi1=PA6,PA7,PA5 BUS_PINS_spi1a=PB4,PB5,PB3 BUS_PINS_spi2=PB14,PB15,PB13 BUS_PINS_spi2a=PC2,PC3,PB10 BUS_PINS_spi3=PB4,PB5,PB3 BUS_PINS_spi3a=PC11,PC12,PC10 BUS_PINS_spi4=PE13,PE14,PE12 CANBUS_FREQUENCY=1000000 CLOCK_FREQ=180000000 MCU=stm32f446xx PWM_MAX=255 RECEIVE_WINDOW=192 RESERVE_PINS_CAN=PB8,PB9 RESERVE_PINS_crystal=PH0,PH1 STATS_SUMSQ_BASE=256 STEPPER_BOTH_EDGE=1
+Build file /home/biqu/klipper/klippy/../out/klipper.elf(1283828): Wed Nov 26 03:55:37 2025
+Starting Klippy...
+Args: ['/home/biqu/klipper/klippy/klippy.py', '/home/biqu/printer_data/config/printer.cfg', '-I', '/home/biqu/printer_data/comms/klippy.serial', '-l', '/home/biqu/printer_data/logs/klippy.log', '-a', '/home/biqu/printer_data/comms/klippy.sock']
+Git version: 'v0.12.0-125-gbfb71bc2d'
+Branch: master
+Remote: origin
+Tracked URL: https://github.com/Klipper3d/klipper
+CPU: 4 core ?
+Python: '3.9.2 (default, Feb 28 2021, 17:03:44) \n[GCC 10.2.1 20210110]'
+Start printer at Sat Mar  7 16:18:21 2026 (1772900301.8 35.3)
+===== Config file =====
+[virtual_sdcard]
+path = ~/printer_data/gcodes
+on_error_gcode = CANCEL_PRINT
+
+[pause_resume]
+
+[display_status]
+
+[respond]
+
+[gcode_macro CANCEL_PRINT]
+description = Cancel the actual running print
+rename_existing = BASE_CANCEL_PRINT
+gcode = 
+	SET_IDLE_TIMEOUT TIMEOUT={printer.configfile.settings.idle_timeout.timeout}
+	CLEAR_PAUSE
+	SDCARD_RESET_FILE
+	PRINT_END
+	BASE_CANCEL_PRINT
+	M106 S0
+
+[gcode_macro PAUSE]
+description = Pause the actual running print
+rename_existing = BASE_PAUSE
+gcode = 
+	
+	{% set z = params.Z|default(10)|int %}
+	
+	{% if printer['pause_resume'].is_paused|int == 0 %}
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE={z}
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=etemp VALUE={printer['extruder'].target}
+	
+	SAVE_GCODE_STATE NAME=PAUSE
+	BASE_PAUSE
+	{% if (printer.gcode_move.position.z + z) < printer.toolhead.axis_maximum.z %}
+	G91
+	G1 Z{z} F900
+	{% else %}
+	{ action_respond_info("Pause zhop exceeds maximum Z height.") }
+	SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE=0
+	{% endif %}
+	G90
+	G1 X{printer.toolhead.axis_maximum.x/2} Y{printer.toolhead.axis_minimum.y+5} F6000
+	SAVE_GCODE_STATE NAME=PAUSEPARK
+	SET_IDLE_TIMEOUT TIMEOUT=43200
+	{% endif %}
+
+[gcode_macro RESUME]
+description = Resume the actual running print
+rename_existing = BASE_RESUME
+variable_last_extruder_temp = {'restore': False, 'temp': 0}
+variable_restore_idle_timeout = 0
+variable_idle_state = False
+gcode = 
+	
+	{% set e = params.E|default(2.5)|int %}
+	
+	{% if printer['pause_resume'].is_paused|int == 1 %}
+	
+	SET_IDLE_TIMEOUT TIMEOUT={printer.configfile.settings.idle_timeout.timeout}
+	RESTORE_GCODE_STATE NAME=PAUSEPARK MOVE=1 MOVE_SPEED=100
+	G91
+	M83
+	G1 E{e} F900
+	RESTORE_GCODE_STATE NAME=PAUSE MOVE=1 MOVE_SPEED=60
+	BASE_RESUME
+	{% endif %}
+variable_zhop = 0
+variable_etemp = 0
+
+[gcode_macro SET_PAUSE_NEXT_LAYER]
+description = Enable a pause if the next layer is reached
+gcode = 
+	{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_next_layer %}
+	{% set ENABLE = params.ENABLE|default(1)|int != 0 %}
+	{% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"
+
+[gcode_macro SET_PAUSE_AT_LAYER]
+description = Enable/disable a pause if a given layer number is reached
+gcode = 
+	{% set pause_at_layer = printer['gcode_macro SET_PRINT_STATS_INFO'].pause_at_layer %}
+	{% set ENABLE = params.ENABLE|int != 0 if params.ENABLE is defined
+	else params.LAYER is defined %}
+	{% set LAYER = params.LAYER|default(pause_at_layer.layer)|int %}
+	{% set MACRO = params.MACRO|default(pause_at_layer.call, True) %}
+	SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_at_layer VALUE="{{ 'enable': ENABLE, 'layer': LAYER, 'call': MACRO }}"
+
+[gcode_macro SET_PRINT_STATS_INFO]
+rename_existing = SET_PRINT_STATS_INFO_BASE
+description = Overwrite, to get pause_next_layer and pause_at_layer feature
+variable_pause_next_layer = { 'enable': False, 'call': "PAUSE" }
+variable_pause_at_layer = { 'enable': False, 'layer': 0, 'call': "PAUSE" }
+gcode = 
+	{% if pause_next_layer.enable %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_next_layer" % pause_next_layer.call}'
+	{pause_next_layer.call}
+	SET_PAUSE_NEXT_LAYER ENABLE=0
+	{% elif pause_at_layer.enable and params.CURRENT_LAYER is defined and params.CURRENT_LAYER|int == pause_at_layer.layer %}
+	RESPOND TYPE=echo MSG='{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}'
+	{pause_at_layer.call}
+	SET_PAUSE_AT_LAYER ENABLE=0
+	{% endif %}
+	SET_PRINT_STATS_INFO_BASE {rawparams}
+
+[gcode_macro _TOOLHEAD_PARK_PAUSE_CANCEL]
+description = Helper: park toolhead used in PAUSE and CANCEL_PRINT
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set velocity = printer.configfile.settings.pause_resume.recover_velocity %}
+	{% set use_custom     = client.use_custom_pos|default(false)|lower == 'true' %}
+	{% set custom_park_x  = client.custom_park_x|default(0.0) %}
+	{% set custom_park_y  = client.custom_park_y|default(0.0) %}
+	{% set park_dz        = client.custom_park_dz|default(2.0)|abs %}
+	{% set sp_hop         = client.speed_hop|default(15) * 60 %}
+	{% set sp_move        = client.speed_move|default(velocity) * 60 %}
+	
+	{% set origin    = printer.gcode_move.homing_origin %}
+	{% set act       = printer.gcode_move.gcode_position %}
+	{% set max       = printer.toolhead.axis_maximum %}
+	{% set cone      = printer.toolhead.cone_start_z|default(max.z) %}
+	{% set round_bed = True if printer.configfile.settings.printer.kinematics is in ['delta','polar','rotary_delta','winch']
+	else False %}
+	
+	{% set z_min = params.Z_MIN|default(0)|float %}
+	{% set z_park = [[(act.z + park_dz), z_min]|max, (max.z - origin.z)]|min %}
+	{% set x_park = params.X       if params.X is defined
+	else custom_park_x  if use_custom
+	else 0.0            if round_bed
+	else (max.x - 5.0) %}
+	{% set y_park = params.Y       if params.Y is defined
+	else custom_park_y  if use_custom
+	else (max.y - 5.0)  if round_bed and z_park < cone
+	else 0.0            if round_bed
+	else (max.y - 5.0) %}
+	
+	_CLIENT_RETRACT
+	{% if "xyz" in printer.toolhead.homed_axes %}
+	G90
+	G1 Z{z_park} F{sp_hop}
+	G1 X{x_park} Y{y_park} F{sp_move}
+	{% if not printer.gcode_move.absolute_coordinates %} G91 {% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='Printer not homed'
+	{% endif %}
+
+[gcode_macro _CLIENT_EXTRUDE]
+description = Extrudes, if the extruder is hot enough
+gcode = 
+	
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set use_fw_retract = (client.use_fw_retract|default(false)|lower == 'true') and (printer.firmware_retraction is defined) %}
+	{% set length = params.LENGTH|default(client.unretract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_unretract)|default(35) %}
+	{% set absolute_extrude = printer.gcode_move.absolute_extrude %}
+	
+	{% if printer.toolhead.extruder != '' %}
+	{% if printer[printer.toolhead.extruder].can_extrude %}
+	{% if use_fw_retract %}
+	{% if length < 0 %}
+	G10
+	{% else %}
+	G11
+	{% endif %}
+	{% else %}
+	M83
+	G1 E{length} F{(speed|float|abs) * 60}
+	{% if absolute_extrude %}
+	M82
+	{% endif %}
+	{% endif %}
+	{% else %}
+	RESPOND TYPE=echo MSG='{"\"%s\" not hot enough" % printer.toolhead.extruder}'
+	{% endif %}
+	{% endif %}
+
+[gcode_macro _CLIENT_RETRACT]
+description = Retracts, if the extruder is hot enough
+gcode = 
+	{% set client = printer['gcode_macro _CLIENT_VARIABLE']|default({}) %}
+	{% set length = params.LENGTH|default(client.retract)|default(1.0)|float %}
+	{% set speed = params.SPEED|default(client.speed_retract)|default(35) %}
+	
+	_CLIENT_EXTRUDE LENGTH=-{length|float|abs} SPEED={speed|float|abs}
+
+[exclude_object]
+
+[gcode_macro VORON_PURGE]
+description = A purge macro that adapts to be near your actual printed objects
+gcode = 
+	
+	{% set travel_speed = (printer.toolhead.max_velocity) * 60 | float %}
+	{% set cross_section = printer.configfile.settings.extruder.max_extrude_cross_section | float %}
+	
+	
+	{% if printer.firmware_retraction is defined %}
+	{% set RETRACT = G10 | string %}
+	{% set UNRETRACT = G11 | string %}
+	{% else %}
+	{% set RETRACT = 'G1 E-.5 F2100' | string %}
+	{% set UNRETRACT = 'G1 E.5 F2100' | string %}
+	{% endif %}
+	
+	
+	{% set kamp_settings = printer["gcode_macro _KAMP_Settings"] %}
+	{% set verbose_enable = kamp_settings.verbose_enable | abs %}
+	{% set purge_height = kamp_settings.purge_height | float %}
+	{% set tip_distance = kamp_settings.tip_distance | float %}
+	{% set purge_margin = kamp_settings.purge_margin | float %}
+	{% set purge_amount = kamp_settings.purge_amount | float %}
+	{% set flow_rate = kamp_settings.flow_rate | float %}
+	{% set size = 10 | float %}
+	
+	
+	{% set all_points = printer.exclude_object.objects | map(attribute='polygon') | sum(start=[]) %}
+	{% set purge_x_min = (all_points | map(attribute=0) | min | default(0)) %}
+	{% set purge_x_max = (all_points | map(attribute=0) | max | default(0)) %}
+	{% set purge_y_min = (all_points | map(attribute=1) | min | default(0)) %}
+	{% set purge_y_max = (all_points | map(attribute=1) | max | default(0)) %}
+	
+	{% set purge_x_center = ([((purge_x_max + purge_x_min) / 2) - (purge_amount / 2), 0] | max) %}
+	{% set purge_y_center = ([((purge_y_max + purge_y_min) / 2) - (purge_amount / 2), 0] | max) %}
+	
+	{% set purge_x_origin = ([purge_x_min - purge_margin, 0] | max) %}
+	{% set purge_y_origin = ([purge_y_min - purge_margin, 0] | max) %}
+	
+	
+	{% set purge_move_speed = (flow_rate / 5.0) * 60 | float %}
+	
+	{% if cross_section < 5 %}
+	
+	{action_respond_info("[Extruder] max_extrude_cross_section is insufficient for purge, please set it to 5 or greater. Purge skipped.")}
+	
+	{% else %}
+	
+	{% if verbose_enable == True %}
+	
+	{action_respond_info("Moving filament tip {}mms".format(
+	(tip_distance),
+	)) }
+	{% endif %}
+	
+	{% if printer.firmware_retraction is defined %}
+	{action_respond_info("KAMP purge is using firmware retraction.")}
+	{% else %}
+	{action_respond_info("KAMP purge is not using firmware retraction, it is recommended to configure it.")}
+	{% endif %}
+	
+	SAVE_GCODE_STATE NAME=Prepurge_State
+	
+	G92 E0
+	G0 F{travel_speed}
+	G90
+	G0 X{purge_x_origin} Y{purge_y_origin+size/2}
+	G0 Z{purge_height}
+	M83
+	G1 E{tip_distance} F{purge_move_speed}
+	G1 X{purge_x_origin+size*0.289} Y{purge_y_origin+size} E{purge_amount/4} F{purge_move_speed}
+	{RETRACT}
+	G0 Z{purge_height*2}
+	G0 X{purge_x_origin+size*0.789} Y{purge_y_origin+size}
+	G0 Z{purge_height}
+	{UNRETRACT}
+	G1 X{purge_x_origin+size*0.211} Y{purge_y_origin} E{purge_amount/2} F{purge_move_speed}
+	{RETRACT}
+	G0 Z{purge_height*2}
+	G0 X{purge_x_origin+size*0.711} Y{purge_y_origin}
+	G0 Z{purge_height}
+	{UNRETRACT}
+	G1 X{purge_x_origin+size} Y{purge_y_origin+size/2}  E{purge_amount/4} F{purge_move_speed}
+	{RETRACT}
+	G92 E0
+	M82
+	G0 Z{purge_height*2} F{travel_speed}
+	
+	RESTORE_GCODE_STATE NAME=Prepurge_State
+	
+	{% endif %}
+
+[gcode_macro _KAMP_Settings]
+description = This macro contains all adjustable settings for KAMP
+variable_verbose_enable = True
+variable_mesh_margin = 0
+variable_fuzz_amount = 0
+variable_probe_dock_enable = False
+variable_attach_macro = 'Attach_Probe'
+variable_detach_macro = 'Dock_Probe'
+variable_purge_height = 0.8
+variable_tip_distance = 45
+variable_purge_margin = 10
+variable_purge_amount = 30
+variable_flow_rate = 12
+variable_smart_park_height = 10
+gcode = 
+	
+	{action_respond_info(" Running the KAMP_Settings macro does nothing, it is only used for storing KAMP settings. ")}
+
+[mcu]
+canbus_uuid = b0bc8d3af556
+
+[temperature_sensor mcu_temp]
+sensor_type = temperature_mcu
+min_temp = 0
+max_temp = 100
+
+[printer]
+kinematics = corexy
+max_velocity = 500
+max_accel = 20000
+max_z_velocity = 15
+max_z_accel = 45
+square_corner_velocity = 8.0
+
+[input_shaper]
+shaper_freq_x = 126.4
+shaper_type_x = mzv
+shaper_freq_y = 82.8
+shaper_type_y = mzv
+
+[stepper_x]
+step_pin = PC0
+dir_pin = PC1
+enable_pin = !PC3
+rotation_distance = 40
+microsteps = 32
+full_steps_per_rotation = 200
+endstop_pin = tmc2209_stepper_x:virtual_endstop
+position_endstop = 120.0
+position_max = 120.0
+homing_speed = 40
+homing_retract_dist = 0
+homing_positive_dir = true
+
+[tmc2209 stepper_x]
+uart_pin = PB3
+uart_address = 0
+interpolate = False
+run_current = 0.6
+sense_resistor = 0.220
+stealthchop_threshold = 0
+diag_pin = ^PA2
+driver_sgthrs = 100
+
+[stepper_y]
+step_pin = PC14
+dir_pin = PC13
+enable_pin = !PC15
+rotation_distance = 40
+microsteps = 32
+full_steps_per_rotation = 200
+endstop_pin = tmc2209_stepper_y:virtual_endstop
+position_endstop = 119.0
+position_max = 119.0
+homing_speed = 40
+homing_retract_dist = 0
+homing_positive_dir = true
+
+[tmc2209 stepper_y]
+uart_pin = PB3
+uart_address = 1
+interpolate = False
+run_current = 0.6
+sense_resistor = 0.220
+stealthchop_threshold = 0
+diag_pin = ^PA3
+driver_sgthrs = 100
+
+[stepper_z]
+step_pin = PB4
+dir_pin = !PB5
+enable_pin = !PC2
+rotation_distance = 8
+microsteps = 32
+endstop_pin = ^PC4
+position_endstop = 119.6
+position_max = 119.6
+position_min = 0
+homing_speed = 20
+second_homing_speed = 3.0
+homing_retract_dist = 3.0
+
+[tmc2209 stepper_z]
+uart_pin = PB3
+uart_address = 2
+interpolate = False
+run_current = 0.3
+sense_resistor = 0.220
+stealthchop_threshold = 0
+
+[extruder]
+step_pin = PB2
+dir_pin = !PA15
+enable_pin = !PD2
+full_steps_per_rotation = 200
+rotation_distance = 22.40
+gear_ratio = 50:10
+microsteps = 32
+nozzle_diameter = 0.400
+filament_diameter = 1.750
+heater_pin = PC7
+sensor_type = Generic 3950
+sensor_pin = PC5
+min_temp = 0
+max_temp = 280
+min_extrude_temp = 170
+max_extrude_only_distance = 150
+max_extrude_cross_section = 5.0
+pressure_advance = 0.0
+pressure_advance_smooth_time = 0.040
+control = pid
+pid_kp = 27.029
+pid_ki = 1.133
+pid_kd = 161.158
+
+[tmc2209 extruder]
+uart_pin = PB3
+uart_address = 3
+interpolate = False
+run_current = 0.4
+sense_resistor = 0.220
+stealthchop_threshold = 0
+
+[firmware_retraction]
+retract_length = 0.8
+retract_speed = 40
+unretract_extra_length = 0
+unretract_speed = 40
+
+[verify_heater extruder]
+max_error = 150
+check_gain_time = 40
+hysteresis = 10
+heating_gain = 2
+
+[heater_bed]
+heater_pin = PC8
+sensor_type = Generic 3950
+sensor_pin = PB0
+smooth_time = 3.0
+min_temp = 0
+max_temp = 120
+control = pid
+pid_kp = 65.665
+pid_ki = 3.367
+pid_kd = 320.117
+
+[heater_fan hotend_fan]
+pin = PA13
+max_power = 1.0
+kick_start_time = 0.5
+heater = extruder
+heater_temp = 50.0
+
+[fan]
+pin = PA14
+max_power = 1.0
+kick_start_time = 0.5
+off_below = 0.13
+cycle_time = 0.010
+
+[temperature_fan btt_pi]
+pin = PA8
+max_power = 1
+shutdown_speed = 0.0
+cycle_time = 0.01
+hardware_pwm = False
+kick_start_time = 0
+sensor_type = temperature_host
+min_temp = 10
+max_temp = 80
+target_temp = 45
+max_speed = 1
+min_speed = 0.0
+control = pid
+pid_kp = 2.0
+pid_ki = 5.0
+pid_kd = 0.5
+pid_deriv_time = 2.0
+gcode_id = pi
+
+[idle_timeout]
+timeout = 36000
+
+[homing_override]
+gcode = 
+	_HOME_X
+	_HOME_Y
+	G28 Z
+
+[bed_screws]
+screw1 = 60,5
+screw1_name = front screw
+screw2 = 5,115
+screw2_name = back left
+screw3 = 115,115
+screw3_name = back right
+
+[neopixel board_rgb]
+pin = PC9
+chain_count = 1
+color_order = GRB
+initial_red = 0.0
+initial_green = 0.1
+initial_blue = 0.0
+
+[gcode_macro PRINT_START]
+gcode = 
+	{% set BED_TEMP = params.BED_TEMP|default(60)|float %}
+	{% set EXTRUDER_TEMP = params.EXTRUDER_TEMP|default(190)|float %}
+	
+	G90
+	G92 E0
+	
+	
+	M140 S{BED_TEMP}
+	M104 S{EXTRUDER_TEMP}
+	
+	
+	_CG28
+	G28 Z
+	G90
+	
+	
+	M190 S{BED_TEMP}
+	M109 S{EXTRUDER_TEMP}
+	
+	
+	G1 Z5 F3000
+	VORON_PURGE
+	
+	G92 E0
+
+[gcode_macro PRINT_END]
+gcode = 
+	TURN_OFF_HEATERS
+	G91
+	G1 Z10 F1500
+	G1 E-1 F3000
+	G90
+	G1 X100 Y100 F3000
+	M106 S0
+	SET_STEPPER_ENABLE STEPPER=extruder ENABLE=0
+	BED_MESH_CLEAR
+
+[gcode_macro _HOME_X]
+gcode = 
+	
+	{% set RUN_CURRENT_X = printer.configfile.settings['tmc2209 stepper_x'].run_current|float %}
+	{% set RUN_CURRENT_Y = printer.configfile.settings['tmc2209 stepper_y'].run_current|float %}
+	{% set HOME_CURRENT_X = RUN_CURRENT_X / 2 %}
+	{% set HOME_CURRENT_Y = RUN_CURRENT_Y / 2 %}
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={HOME_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={HOME_CURRENT_Y}
+	
+	set_tmc_field stepper=stepper_x field=tcoolthrs value=1048575
+	set_tmc_field stepper=stepper_y field=tcoolthrs value=1048575
+	
+	
+	G28 X
+	
+	G91
+	G1 X-10 F1200
+	
+	
+	G4 P100
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={RUN_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={RUN_CURRENT_Y}
+
+[gcode_macro _HOME_Y]
+gcode = 
+	
+	{% set RUN_CURRENT_X = printer.configfile.settings['tmc2209 stepper_x'].run_current|float %}
+	{% set RUN_CURRENT_Y = printer.configfile.settings['tmc2209 stepper_y'].run_current|float %}
+	{% set HOME_CURRENT_X = RUN_CURRENT_X / 2 %}
+	{% set HOME_CURRENT_Y = RUN_CURRENT_Y / 2 %}
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={HOME_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={HOME_CURRENT_Y}
+	
+	set_tmc_field stepper=stepper_x field=tcoolthrs value=1048575
+	set_tmc_field stepper=stepper_y field=tcoolthrs value=1048575
+	
+	
+	G28 Y
+	
+	G91
+	G1 Y-10 F1200
+	
+	
+	G4 P1000
+	
+	SET_TMC_CURRENT STEPPER=stepper_x CURRENT={RUN_CURRENT_X}
+	SET_TMC_CURRENT STEPPER=stepper_y CURRENT={RUN_CURRENT_Y}
+
+[gcode_macro M600]
+gcode = 
+	SAVE_GCODE_STATE NAME=M600_state
+	PAUSE
+	M300
+	G91
+	G1 E-50 F1000
+	M300
+	M300
+	RESTORE_GCODE_STATE NAME=M600_state
+
+[gcode_macro _CG28]
+gcode = 
+	{% if "xyz" not in printer.toolhead.homed_axes %}
+	G28
+	{% endif %}
+
+[gcode_macro LOAD_FILAMENT]
+gcode = 
+	M83
+	G1 E30 F300
+	G1 E15 F150
+	M82
+
+[gcode_macro UNLOAD_FILAMENT]
+gcode = 
+	M83
+	G1 E10 F300
+	G1 E-40 F1800
+	M82
+=======================
+Extruder max_extrude_ratio=2.078758
+mcu 'mcu': Starting CAN connect
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+webhooks client 281473080546832: New connection
+webhooks client 281473080546832: Client info {'program': 'Moonraker', 'version': 'v0.8.0-324-ga3e4dac'}
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+Created a socket
+mcu 'mcu': Unable to open CAN port: [Errno 19] No such device
+MCU error during connect
+Traceback (most recent call last):
+  File "/home/biqu/klipper/klippy/mcu.py", line 763, in _mcu_identify
+    self._serial.connect_canbus(self._serialport, nodeid,
+  File "/home/biqu/klipper/klippy/serialhdl.py", line 133, in connect_canbus
+    self._error("Unable to connect")
+  File "/home/biqu/klipper/klippy/serialhdl.py", line 61, in _error
+    raise error(self.warn_prefix + (msg % params))
+serialhdl.error: mcu 'mcu': Unable to connect
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/biqu/klipper/klippy/klippy.py", line 176, in _connect
+    self.send_event("klippy:mcu_identify")
+  File "/home/biqu/klipper/klippy/klippy.py", line 263, in send_event
+    return [cb(*params) for cb in self.event_handlers.get(event, [])]
+  File "/home/biqu/klipper/klippy/klippy.py", line 263, in <listcomp>
+    return [cb(*params) for cb in self.event_handlers.get(event, [])]
+  File "/home/biqu/klipper/klippy/mcu.py", line 774, in _mcu_identify
+    raise error(str(e))
+mcu.error: mcu 'mcu': Unable to connect
+Build file /home/biqu/klipper/klippy/../.config(3382): Wed Nov 26 03:54:33 2025
+========= Last MCU build config =========
+CONFIG_LOW_LEVEL_OPTIONS=y
+# CONFIG_MACH_AVR is not set
+# CONFIG_MACH_ATSAM is not set
+# CONFIG_MACH_ATSAMD is not set
+# CONFIG_MACH_LPC176X is not set
+CONFIG_MACH_STM32=y
+# CONFIG_MACH_HC32F460 is not set
+# CONFIG_MACH_RP2040 is not set
+# CONFIG_MACH_PRU is not set
+# CONFIG_MACH_AR100 is not set
+# CONFIG_MACH_LINUX is not set
+# CONFIG_MACH_SIMU is not set
+CONFIG_BOARD_DIRECTORY="stm32"
+CONFIG_MCU="stm32f446xx"
+CONFIG_CLOCK_FREQ=180000000
+CONFIG_FLASH_SIZE=0x80000
+CONFIG_FLASH_BOOT_ADDRESS=0x8000000
+CONFIG_RAM_START=0x20000000
+CONFIG_RAM_SIZE=0x20000
+CONFIG_STACK_SIZE=512
+CONFIG_FLASH_APPLICATION_ADDRESS=0x8008000
+CONFIG_STM32_SELECT=y
+# CONFIG_MACH_STM32F103 is not set
+# CONFIG_MACH_STM32F207 is not set
+# CONFIG_MACH_STM32F401 is not set
+# CONFIG_MACH_STM32F405 is not set
+# CONFIG_MACH_STM32F407 is not set
+# CONFIG_MACH_STM32F429 is not set
+CONFIG_MACH_STM32F446=y
+# CONFIG_MACH_STM32F765 is not set
+# CONFIG_MACH_STM32F031 is not set
+# CONFIG_MACH_STM32F042 is not set
+# CONFIG_MACH_STM32F070 is not set
+# CONFIG_MACH_STM32F072 is not set
+# CONFIG_MACH_STM32G070 is not set
+# CONFIG_MACH_STM32G071 is not set
+# CONFIG_MACH_STM32G0B0 is not set
+# CONFIG_MACH_STM32G0B1 is not set
+# CONFIG_MACH_STM32G431 is not set
+# CONFIG_MACH_STM32H723 is not set
+# CONFIG_MACH_STM32H743 is not set
+# CONFIG_MACH_STM32H750 is not set
+# CONFIG_MACH_STM32L412 is not set
+# CONFIG_MACH_N32G452 is not set
+# CONFIG_MACH_N32G455 is not set
+CONFIG_MACH_STM32F4=y
+CONFIG_HAVE_STM32_USBOTG=y
+CONFIG_HAVE_STM32_CANBUS=y
+CONFIG_HAVE_STM32_USBCANBUS=y
+CONFIG_STM32_DFU_ROM_ADDRESS=0
+CONFIG_STM32_FLASH_START_8000=y
+# CONFIG_STM32_FLASH_START_10000 is not set
+# CONFIG_STM32_FLASH_START_0000 is not set
+# CONFIG_STM32_CLOCK_REF_8M is not set
+CONFIG_STM32_CLOCK_REF_12M=y
+# CONFIG_STM32_CLOCK_REF_16M is not set
+# CONFIG_STM32_CLOCK_REF_20M is not set
+# CONFIG_STM32_CLOCK_REF_24M is not set
+# CONFIG_STM32_CLOCK_REF_25M is not set
+# CONFIG_STM32_CLOCK_REF_INTERNAL is not set
+CONFIG_CLOCK_REF_FREQ=12000000
+CONFIG_STM32F0_TRIM=16
+# CONFIG_STM32_USB_PA11_PA12 is not set
+# CONFIG_STM32_SERIAL_USART1 is not set
+# CONFIG_STM32_SERIAL_USART1_ALT_PB7_PB6 is not set
+# CONFIG_STM32_SERIAL_USART2 is not set
+# CONFIG_STM32_SERIAL_USART2_ALT_PD6_PD5 is not set
+# CONFIG_STM32_SERIAL_USART3 is not set
+# CONFIG_STM32_SERIAL_USART3_ALT_PD9_PD8 is not set
+# CONFIG_STM32_CANBUS_PA11_PA12 is not set
+# CONFIG_STM32_CANBUS_PA11_PB9 is not set
+CONFIG_STM32_MMENU_CANBUS_PB8_PB9=y
+# CONFIG_STM32_MMENU_CANBUS_PI9_PH13 is not set
+# CONFIG_STM32_MMENU_CANBUS_PB5_PB6 is not set
+# CONFIG_STM32_MMENU_CANBUS_PB12_PB13 is not set
+# CONFIG_STM32_MMENU_CANBUS_PD0_PD1 is not set
+# CONFIG_STM32_USBCANBUS_PA11_PA12 is not set
+CONFIG_STM32_CANBUS_PB8_PB9=y
+CONFIG_USB_VENDOR_ID=0x1d50
+CONFIG_USB_DEVICE_ID=0x614e
+CONFIG_USB_SERIAL_NUMBER="12345"
+CONFIG_WANT_GPIO_BITBANGING=y
+CONFIG_WANT_DISPLAYS=y
+CONFIG_WANT_SENSORS=y
+CONFIG_WANT_LIS2DW=y
+CONFIG_WANT_SOFTWARE_I2C=y
+CONFIG_WANT_SOFTWARE_SPI=y
+CONFIG_NEED_SENSOR_BULK=y
+CONFIG_CANSERIAL=y
+CONFIG_CANBUS=y
+CONFIG_CANBUS_FREQUENCY=1000000
+CONFIG_CANBUS_FILTER=y
+CONFIG_INITIAL_PINS=""
+CONFIG_HAVE_GPIO=y
+CONFIG_HAVE_GPIO_ADC=y
+CONFIG_HAVE_GPIO_SPI=y
+CONFIG_HAVE_GPIO_SDIO=y
+CONFIG_HAVE_GPIO_I2C=y
+CONFIG_HAVE_GPIO_HARD_PWM=y
+CONFIG_HAVE_STRICT_TIMING=y
+CONFIG_HAVE_CHIPID=y
+CONFIG_HAVE_STEPPER_BOTH_EDGE=y
+CONFIG_HAVE_BOOTLOADER_REQUEST=y
+CONFIG_INLINE_STEPPER_HACK=y
+=======================
+Build file /home/biqu/klipper/klippy/../out/klipper.dict(8570): Wed Nov 26 03:55:23 2025
+Last MCU build version: v0.12.0-125-gbfb71bc2d
+Last MCU build tools: gcc: (15:8-2019-q3-1+b1) 8.3.1 20190703 (release) [gcc-8-branch revision 273027] binutils: (2.35.2-2+14+b2) 2.35.2
+Last MCU build config: ADC_MAX=4095 BUS_PINS_i2c1=PB6,PB7 BUS_PINS_i2c1a=PB8,PB9 BUS_PINS_i2c2=PB10,PB11 BUS_PINS_i2c3=PA8,PC9 BUS_PINS_sdio=PC12,PD2,PC8,PC9,PC10,PC11 BUS_PINS_spi1=PA6,PA7,PA5 BUS_PINS_spi1a=PB4,PB5,PB3 BUS_PINS_spi2=PB14,PB15,PB13 BUS_PINS_spi2a=PC2,PC3,PB10 BUS_PINS_spi3=PB4,PB5,PB3 BUS_PINS_spi3a=PC11,PC12,PC10 BUS_PINS_spi4=PE13,PE14,PE12 CANBUS_FREQUENCY=1000000 CLOCK_FREQ=180000000 MCU=stm32f446xx PWM_MAX=255 RECEIVE_WINDOW=192 RESERVE_PINS_CAN=PB8,PB9 RESERVE_PINS_crystal=PH0,PH1 STATS_SUMSQ_BASE=256 STEPPER_BOTH_EDGE=1
+Build file /home/biqu/klipper/klippy/../out/klipper.elf(1283828): Wed Nov 26 03:55:37 2025
